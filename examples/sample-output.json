@@ -1,0 +1,36 @@
+{
+  "version": "1.0.0",
+  "timestamp": "2024-03-10T15:30:45Z",
+  "node": {
+    "hostname": "compute-node-42",
+    "platform": "linux"
+  },
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "name": "NVIDIA A100-SXM4-80GB",
+      "uuid": "GPU-abc123...",
+      "utilization_gpu_percent": 87.0,
+      "memory_used_mb": 52428,
+      "memory_total_mb": 81920,
+      "temperature_c": 72.0,
+      "power_draw_watts": 350.5,
+      "vendor": "nvidia",
+      "collection_method": "nvidia-smi"
+    }
+  ],
+  "gpu_processes": [
+    {
+      "pid": 12345,
+      "name": "python3",
+      "user": "alice",
+      "gpu_memory_mb": 8192,
+      "cpu_percent": 45.2,
+      "cmdline": "python3 train.py --model resnet50"
+    }
+  ],
+  "summary": {
+    "total_gpus": 1,
+    "total_gpu_processes": 1
+  }
+}
