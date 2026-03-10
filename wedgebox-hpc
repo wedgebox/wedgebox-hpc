@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+WedgeBox-HPC: GPU Performance Monitoring for HPC Clusters
+https://github.com/wedgebox/wedgebox-hpc
+
+Monitors GPU utilization, memory usage, and process performance for
+debugging and optimizing machine learning workloads.
+
+Usage:
+    wedgebox-hpc
+
+Output:
+    wedgebox-report-[timestamp].json - Detailed GPU telemetry report
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import subprocess
+import re
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+VERSION = "1.0.0"
+
+# Check for psutil, try to guide user if missing
+try:
+    import psutil
+except ImportError:
+    print("=" * 70)
+    print("ERROR: psutil library not found")
+    print("=" * 70)
+    print("\npsutil is required for process monitoring.")
+    print("\nTo install:")
+    print("  pip install psutil --user")
+    print("\nOr ask your HPC admin to install psutil system-wide.")
+    print("=" * 70)
+    sys.exit(1)
+
+
+class GPUCollector:
+    """
+    Collects GPU metrics using multiple methods with automatic fallback.
+    
+    Supports:
+    - NVIDIA GPUs (via nvidia-smi)
+    - AMD GPUs (via rocm-smi)
+    - Fallback to /proc filesystem if tools unavailable
+    """
+    
+    def __init__(self):
+        self.hostname = socket.gethostname()
+        self.detection_methods = []
+        self._detect_available_methods()
+    
+    def _detect_available_methods(self):
+        """Detect which GPU monitoring tools are available"""
+        if self._command_exists('nvidia-smi'):
+            self.detection_methods.append('nvidia-smi')
+        
+        if self._command_exists('rocm-smi'):
+            self.detection_methods.append('rocm-smi')
+        
+        # Fallback always available
+        self.detection_methods.append('proc')
+    
+    def _command_exists(self, command):
+        """Check if a command is available in PATH"""
+        try:
+            subprocess.run(
+                [command, '--help'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2
+            )
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+            return False
+    
+    def collect(self):
+        """Collect GPU metrics using best available method"""
+        if 'nvidia-smi' in self.detection_methods:
+            return self._collect_nvidia()
+        elif 'rocm-smi' in self.detection_methods:
+            return self._collect_amd()
+        else:
+            return self._collect_proc()
+    
+    def _collect_nvidia(self):
+        """Collect NVIDIA GPU metrics via nvidia-smi"""
+        try:
+            result = subprocess.run(
+                [
+                    'nvidia-smi',
+                    '--query-gpu=index,name,uuid,pci.bus_id,driver_version,'
+                    'utilization.gpu,utilization.memory,memory.used,memory.total,'
+                    'memory.free,temperature.gpu,power.draw,power.limit,'
+                    'clocks.current.graphics,clocks.current.memory',
+                    '--format=csv,noheader,nounits'
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return self._collect_proc()
+            
+            gpus = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) < 15:
+                    continue
+                
+                gpus.append({
+                    'gpu_id': int(parts[0]),
+                    'name': parts[1],
+                    'uuid': parts[2],
+                    'pci_bus_id': parts[3],
+                    'driver_version': parts[4],
+                    'utilization_gpu_percent': self._safe_float(parts[5]),
+                    'utilization_memory_percent': self._safe_float(parts[6]),
+                    'memory_used_mb': self._safe_float(parts[7]),
+                    'memory_total_mb': self._safe_float(parts[8]),
+                    'memory_free_mb': self._safe_float(parts[9]),
+                    'temperature_c': self._safe_float(parts[10]),
+                    'power_draw_watts': self._safe_float(parts[11]),
+                    'power_limit_watts': self._safe_float(parts[12]),
+                    'clock_graphics_mhz': self._safe_float(parts[13]),
+                    'clock_memory_mhz': self._safe_float(parts[14]),
+                    'vendor': 'nvidia',
+                    'collection_method': 'nvidia-smi'
+                })
+            
+            return gpus
+            
+        except Exception:
+            return self._collect_proc()
+    
+    def _collect_amd(self):
+        """Collect AMD GPU metrics via rocm-smi"""
+        try:
+            result = subprocess.run(
+                ['rocm-smi', '--showid', '--showuse', '--showmeminfo', 'vram', '--showtemp'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return self._collect_proc()
+            
+            gpus = []
+            gpu_id = 0
+            
+            for line in result.stdout.split('\n'):
+                if 'GPU[' in line or 'card' in line.lower():
+                    gpus.append({
+                        'gpu_id': gpu_id,
+                        'name': self._extract_value(line, 'name') or f'AMD GPU {gpu_id}',
+                        'uuid': f'amd-gpu-{gpu_id}',
+                        'utilization_gpu_percent': self._extract_numeric(line, 'use'),
+                        'temperature_c': self._extract_numeric(line, 'temp'),
+                        'memory_used_mb': self._extract_numeric(line, 'vram'),
+                        'vendor': 'amd',
+                        'collection_method': 'rocm-smi'
+                    })
+                    gpu_id += 1
+            
+            return gpus if gpus else self._collect_proc()
+            
+        except Exception:
+            return self._collect_proc()
+    
+    def _collect_proc(self):
+        """Fallback: Collect basic GPU info from /proc and /dev"""
+        gpus = []
+        
+        # Check for NVIDIA devices
+        nvidia_devices = list(Path('/dev').glob('nvidia[0-9]*'))
+        for i, device in enumerate(nvidia_devices):
+            gpus.append({
+                'gpu_id': i,
+                'name': f'NVIDIA GPU {i}',
+                'uuid': f'nvidia-dev-{i}',
+                'device_file': str(device),
+                'vendor': 'nvidia',
+                'collection_method': 'proc-filesystem'
+            })
+        
+        # Check for AMD devices
+        if Path('/dev/dri').exists():
+            amd_devices = list(Path('/dev/dri').glob('card[0-9]*'))
+            for i, device in enumerate(amd_devices):
+                gpus.append({
+                    'gpu_id': len(nvidia_devices) + i,
+                    'name': f'AMD GPU {i}',
+                    'uuid': f'amd-dev-{i}',
+                    'device_file': str(device),
+                    'vendor': 'amd',
+                    'collection_method': 'proc-filesystem'
+                })
+        
+        return gpus
+    
+    def _safe_float(self, value):
+        """Safely convert string to float"""
+        try:
+            return float(value) if value not in ['N/A', '[N/A]', '', '[Not Supported]'] else None
+        except:
+            return None
+    
+    def _extract_value(self, line, keyword):
+        """Extract value from line containing keyword"""
+        match = re.search(f'{keyword}[:\\s]+([^,\\n]+)', line, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+    
+    def _extract_numeric(self, line, keyword):
+        """Extract numeric value from line"""
+        match = re.search(f'{keyword}[:\\s]+([0-9.]+)', line, re.IGNORECASE)
+        return float(match.group(1)) if match else None
+
+
+class ProcessCollector:
+    """
+    Collects information about processes using GPUs.
+    
+    Provides process-level GPU resource consumption for debugging
+    multi-tenant workloads and identifying resource bottlenecks.
+    """
+    
+    def collect(self):
+        """Collect all GPU process information"""
+        processes = []
+        
+        # Try nvidia-smi for NVIDIA GPU processes
+        nvidia_procs = self._collect_nvidia_processes()
+        processes.extend(nvidia_procs)
+        
+        # Try /proc filesystem for all GPU processes
+        proc_procs = self._collect_proc_processes()
+        processes.extend(proc_procs)
+        
+        # Deduplicate by PID
+        seen_pids = set()
+        unique_processes = []
+        for proc in processes:
+            if proc['pid'] not in seen_pids:
+                seen_pids.add(proc['pid'])
+                unique_processes.append(proc)
+        
+        return unique_processes
+    
+    def _collect_nvidia_processes(self):
+        """Collect NVIDIA GPU process information"""
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return []
+            
+            processes = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) < 3:
+                    continue
+                
+                try:
+                    pid = int(parts[0])
+                    proc_info = self._get_process_details(pid)
+                    
+                    if proc_info:
+                        proc_info['gpu_memory_mb'] = float(parts[2].replace(' MiB', '')) if 'MiB' in parts[2] else None
+                        proc_info['detection_method'] = 'nvidia-smi'
+                        processes.append(proc_info)
+                except:
+                    continue
+            
+            return processes
+            
+        except Exception:
+            return []
+    
+    def _collect_proc_processes(self):
+        """Collect GPU processes from /proc filesystem"""
+        processes = []
+        gpu_device_files = [
+            '/dev/nvidia0', '/dev/nvidia1', '/dev/nvidia2', '/dev/nvidia3',
+            '/dev/dri/card0', '/dev/dri/card1', '/dev/dri/renderD128'
+        ]
+        
+        for proc_dir in Path('/proc').glob('[0-9]*'):
+            try:
+                pid = int(proc_dir.name)
+                fd_dir = proc_dir / 'fd'
+                
+                if not fd_dir.exists():
+                    continue
+                
+                # Check if process has GPU devices open
+                has_gpu = False
+                try:
+                    for fd in fd_dir.iterdir():
+                        try:
+                            target = fd.resolve()
+                            if any(str(target).startswith(dev) for dev in gpu_device_files):
+                                has_gpu = True
+                                break
+                        except (PermissionError, FileNotFoundError):
+                            continue
+                except PermissionError:
+                    continue
+                
+                if has_gpu:
+                    proc_info = self._get_process_details(pid)
+                    if proc_info:
+                        proc_info['detection_method'] = 'proc-filesystem'
+                        processes.append(proc_info)
+                        
+            except (ValueError, PermissionError):
+                continue
+        
+        return processes
+    
+    def _get_process_details(self, pid):
+        """Get detailed process information"""
+        try:
+            proc = psutil.Process(pid)
+            
+            # Get command line
+            try:
+                cmdline_array = proc.cmdline()
+                cmdline_str = ' '.join(cmdline_array) if cmdline_array else ''
+            except:
+                cmdline_str = ''
+                cmdline_array = []
+            
+            # Get memory info
+            try:
+                mem_info = proc.memory_info()
+                mem_rss_mb = mem_info.rss / 1024 / 1024
+            except:
+                mem_rss_mb = None
+            
+            # Get CPU percentage
+            try:
+                cpu_percent = proc.cpu_percent(interval=0.1)
+            except:
+                cpu_percent = None
+            
+            # Get start time
+            try:
+                start_time = datetime.fromtimestamp(proc.create_time()).isoformat()
+            except:
+                start_time = None
+            
+            return {
+                'pid': pid,
+                'name': proc.name(),
+                'user': proc.username() if proc.username() else 'unknown',
+                'cmdline': self._sanitize_cmdline(cmdline_str),
+                'cmdline_array': cmdline_array[:10],  # First 10 args only
+                'parent_pid': proc.ppid(),
+                'cpu_percent': cpu_percent,
+                'memory_rss_mb': mem_rss_mb,
+                'start_time': start_time,
+                'status': proc.status()
+            }
+            
+        except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+            return None
+    
+    def _sanitize_cmdline(self, cmdline):
+        """Remove sensitive information from command lines"""
+        # Redact common secret patterns
+        patterns = [
+            (r'--password[= ]\S+', '--password=[REDACTED]'),
+            (r'--api-key[= ]\S+', '--api-key=[REDACTED]'),
+            (r'--token[= ]\S+', '--token=[REDACTED]'),
+        ]
+        
+        for pattern, replacement in patterns:
+            cmdline = re.sub(pattern, replacement, cmdline, flags=re.IGNORECASE)
+        
+        return cmdline[:1000]  # Limit length
+
+
+class SystemCollector:
+    """
+    Collects system-level metrics for context.
+    
+    Helps correlate GPU performance with system resources
+    and identify bottlenecks in CPU, memory, or I/O.
+    """
+    
+    def collect(self):
+        """Collect system metrics"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.5, percpu=False)
+            mem = psutil.virtual_memory()
+            
+            # Get load average on Unix systems
+            try:
+                load_avg = os.getloadavg()
+            except:
+                load_avg = (0, 0, 0)
+            
+            return {
+                'cpu': {
+                    'percent': cpu_percent,
+                    'count_logical': psutil.cpu_count(logical=True),
+                    'load_average_1m': load_avg[0],
+                    'load_average_5m': load_avg[1],
+                    'load_average_15m': load_avg[2]
+                },
+                'memory': {
+                    'total_mb': mem.total / 1024 / 1024,
+                    'available_mb': mem.available / 1024 / 1024,
+                    'percent': mem.percent
+                },
+                'uptime_hours': (time.time() - psutil.boot_time()) / 3600
+            }
+        except Exception:
+            return {}
+
+
+class TelemetryCollector:
+    """
+    Main telemetry orchestrator.
+    
+    Coordinates GPU, process, and system data collection
+    into a unified performance snapshot.
+    """
+    
+    def __init__(self):
+        self.gpu_collector = GPUCollector()
+        self.process_collector = ProcessCollector()
+        self.system_collector = SystemCollector()
+        self.hostname = socket.gethostname()
+    
+    def collect_snapshot(self):
+        """Collect complete telemetry snapshot"""
+        timestamp = datetime.utcnow().isoformat() + 'Z'
+        
+        gpus = self.gpu_collector.collect()
+        processes = self.process_collector.collect()
+        system = self.system_collector.collect()
+        
+        return {
+            'version': VERSION,
+            'timestamp': timestamp,
+            'node': {
+                'hostname': self.hostname,
+                'platform': sys.platform
+            },
+            'gpus': gpus,
+            'gpu_processes': processes,
+            'system': system,
+            'summary': {
+                'total_gpus': len(gpus),
+                'total_gpu_processes': len(processes),
+                'gpu_vendors': list(set([g.get('vendor', 'unknown') for g in gpus])),
+                'collection_methods': list(set([g.get('collection_method', 'unknown') for g in gpus]))
+            }
+        }
+
+
+def print_summary(data):
+    """Print human-readable summary to console"""
+    print("\n" + "=" * 70)
+    print(f"WedgeBox-HPC v{VERSION} - GPU Performance Snapshot")
+    print("=" * 70)
+    
+    print(f"\nNode: {data['node']['hostname']}")
+    print(f"Time: {data['timestamp']}")
+    
+    # GPU Summary
+    print(f"\n{'─' * 70}")
+    print(f"GPUs Detected: {data['summary']['total_gpus']}")
+    print(f"{'─' * 70}")
+    
+    for gpu in data['gpus']:
+        print(f"\nGPU {gpu['gpu_id']}: {gpu.get('name', 'Unknown')}")
+        print(f"  Vendor:       {gpu.get('vendor', 'unknown')}")
+        
+        if gpu.get('utilization_gpu_percent') is not None:
+            print(f"  Utilization:  {gpu['utilization_gpu_percent']:.1f}%")
+        
+        if gpu.get('memory_used_mb') is not None and gpu.get('memory_total_mb') is not None:
+            used = gpu['memory_used_mb']
+            total = gpu['memory_total_mb']
+            percent = (used / total * 100) if total > 0 else 0
+            print(f"  Memory:       {used:.0f} MB / {total:.0f} MB ({percent:.1f}%)")
+        
+        if gpu.get('temperature_c') is not None:
+            print(f"  Temperature:  {gpu['temperature_c']:.0f}°C")
+        
+        if gpu.get('power_draw_watts') is not None:
+            print(f"  Power:        {gpu['power_draw_watts']:.1f}W")
+    
+    # Process Summary
+    print(f"\n{'─' * 70}")
+    print(f"GPU Processes: {data['summary']['total_gpu_processes']}")
+    print(f"{'─' * 70}")
+    
+    if data['gpu_processes']:
+        for proc in data['gpu_processes'][:5]:  # Show first 5
+            print(f"\nPID {proc['pid']}: {proc.get('name', 'unknown')}")
+            print(f"  User:       {proc.get('user', 'unknown')}")
+            if proc.get('gpu_memory_mb'):
+                print(f"  GPU Memory: {proc['gpu_memory_mb']:.0f} MB")
+            if proc.get('cpu_percent') is not None:
+                print(f"  CPU:        {proc['cpu_percent']:.1f}%")
+        
+        if len(data['gpu_processes']) > 5:
+            print(f"\n  ... and {len(data['gpu_processes']) - 5} more processes")
+    else:
+        print("\n  No GPU processes detected")
+    
+    print("\n" + "=" * 70)
+
+
+def main():
+    """Main entry point"""
+    print(f"\nWedgeBox-HPC v{VERSION}")
+    print("GPU Performance Monitor for HPC Clusters")
+    print("https://github.com/wedgebox/wedgebox-hpc\n")
+    
+    # Collect telemetry
+    collector = TelemetryCollector()
+    data = collector.collect_snapshot()
+    
+    # Print summary to console
+    print_summary(data)
+    
+    # Save detailed report to JSON
+    output_file = f"wedgebox-report-{int(time.time())}.json"
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"\n✓ Detailed report saved: {output_file}")
+    print(f"✓ Use for debugging GPU workloads and optimizing performance\n")
+    
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
