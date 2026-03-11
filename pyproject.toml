@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wedgebox-hpc"
+version = "1.0.0"
+authors = [
+    {name = "WedgeBox Team", email = "wedgebox.team@gmail.com"}
+]
+description = "GPU Performance Monitor for HPC Clusters"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+keywords = ["gpu", "monitoring", "hpc", "machine-learning", "performance", "nvidia", "amd"]
+dependencies = [
+    "psutil>=5.8.0"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/wedgebox/wedgebox-hpc"
+"Bug Tracker" = "https://github.com/wedgebox/wedgebox-hpc/issues"
+"Documentation" = "https://github.com/wedgebox/wedgebox-hpc"
+"Source Code" = "https://github.com/wedgebox/wedgebox-hpc"
+
+[project.scripts]
+wedgebox-hpc = "wedgebox_hpc.cli:main"
