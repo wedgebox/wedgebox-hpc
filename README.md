@@ -13,6 +13,7 @@ machine learning workloads on HPC infrastructure.
 - Zero-configuration monitoring
 - Human-readable console output + detailed JSON reports
 
+
 ## Quick Start
 ```bash
 # Download
@@ -22,6 +23,21 @@ chmod +x wedgebox-hpc
 # Run
 ./wedgebox-hpc
 ```
+
+## Institutional Support
+
+WedgeBox-HPC now offers an institutional support program.
+
+**Get deployment support for your institution:**
+
+👉 **[Request Institutional Support](https://wedgebox-hpc-isp.lovable.app)**
+
+We provide:
+- Custom cluster-wide deployment documentation
+- Institution-specific installation guides
+- Priority assistance for approved institutions
+
+**Open to:** Universities, national labs, and research institutions
 
 ## Requirements
 
