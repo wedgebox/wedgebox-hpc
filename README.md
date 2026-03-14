@@ -30,14 +30,14 @@ WedgeBox-HPC now offers an institutional support program.
 
 **Get deployment support for your institution:**
 
-👉 **[Request Institutional Support](https://wedgebox-hpc-isp.lovable.app)**
+👉 **[Request Institutional Support](https://wedgebox-support-request.lovable.app/)**
 
 We provide:
 - Custom cluster-wide deployment documentation
 - Institution-specific installation guides
 - Priority assistance for approved institutions
 
-**Open to:** Universities, national labs, and research institutions
+**Open to:** Universities, national labs, research institutions, and more!
 
 ## Requirements
 
